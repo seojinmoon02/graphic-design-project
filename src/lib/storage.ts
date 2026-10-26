@@ -1,4 +1,4 @@
-import { clear, createStore, delMany, get, keys, set } from 'idb-keyval';
+import { clear, createStore, get, promisifyRequest, set } from 'idb-keyval';
 import type { ExperimentState, StoredAsset, WorkspaceState } from '../types';
 
 const store = createStore('pattern-room', 'workspace');
@@ -11,6 +11,11 @@ const record = (value: unknown): value is Record<string, unknown> =>
 const finite = (value: unknown) => typeof value === 'number' && Number.isFinite(value);
 const color = (value: unknown) => typeof value === 'string' && /^#[\da-f]{6}$/i.test(value);
 const vector = (value: unknown) => Array.isArray(value) && value.length === 3 && value.every(finite);
+
+function isSavedPattern(value: unknown): value is StoredAsset {
+  return record(value) && value.type === 'pattern' && typeof value.id === 'string'
+    && typeof value.name === 'string' && value.blob instanceof Blob && value.inLibrary !== false;
+}
 
 function validPattern(value: unknown): boolean {
   if (!record(value)) return false;
@@ -46,7 +51,7 @@ function validWorkspace(value: unknown): value is WorkspaceState {
 
 function storageError(error: unknown): Error {
   if (error instanceof DOMException && error.name === 'QuotaExceededError') {
-    return new Error('브라우저 저장 공간이 부족합니다. 더 작은 파일을 사용하거나 필요 없는 실험을 초기화해 주세요.');
+    return new Error('브라우저 저장 공간이 부족합니다. 더 작은 파일을 사용하거나 내 패턴에서 사용하지 않는 이미지를 삭제해 주세요.');
   }
   return new Error('이 브라우저에 작업을 저장하지 못했습니다. 브라우저의 사이트 저장 공간 허용 여부를 확인해 주세요.');
 }
@@ -102,7 +107,51 @@ export async function saveWorkspace(state: WorkspaceState): Promise<void> {
 
 export async function saveAsset(asset: StoredAsset): Promise<void> {
   try {
-    await set(`${ASSET_PREFIX}${asset.id}`, asset, store);
+    const saved = asset.type === 'pattern' ? { ...asset, inLibrary: true, createdAt: asset.createdAt ?? Date.now() } : asset;
+    await set(`${ASSET_PREFIX}${asset.id}`, saved, store);
+  } catch (error) {
+    throw storageError(error);
+  }
+}
+
+/** Missing inLibrary flags from earlier versions are treated as existing library entries. */
+export async function listSavedPatterns(): Promise<StoredAsset[]> {
+  try {
+    return await store('readonly', (objectStore) => {
+      const patterns: StoredAsset[] = [];
+      const cursor = objectStore.openCursor();
+      cursor.onsuccess = () => {
+        const entry = cursor.result;
+        if (!entry) return;
+        if (typeof entry.key === 'string' && entry.key.startsWith(ASSET_PREFIX) && isSavedPattern(entry.value)) {
+          patterns.push({ ...entry.value, inLibrary: true });
+        }
+        entry.continue();
+      };
+      return promisifyRequest(objectStore.transaction).then(() => patterns.sort((left, right) => {
+        const leftTime = Number.isFinite(left.createdAt) ? left.createdAt! : 0;
+        const rightTime = Number.isFinite(right.createdAt) ? right.createdAt! : 0;
+        return rightTime - leftTime || left.name.localeCompare(right.name, 'ko') || left.id.localeCompare(right.id);
+      }));
+    });
+  } catch (error) {
+    throw storageError(error);
+  }
+}
+
+/** Hide the library entry while leaving bytes available to current and saved experiments. */
+export async function removeSavedPattern(id: string): Promise<void> {
+  try {
+    await store('readwrite', (objectStore) => {
+      const key = `${ASSET_PREFIX}${id}`;
+      const request = objectStore.get(key);
+      request.onsuccess = () => {
+        if (isSavedPattern(request.result)) {
+          objectStore.put({ ...request.result, inLibrary: false }, key);
+        }
+      };
+      return promisifyRequest(objectStore.transaction);
+    });
   } catch (error) {
     throw storageError(error);
   }
@@ -132,25 +181,52 @@ export function assetIds(state: WorkspaceState): string[] {
 
 export async function pruneAssets(keepIds: string[]): Promise<void> {
   try {
-    // A caller may have unsaved state; always also protect the latest durable A/B snapshots.
-    const saved = await get<unknown>(WORKSPACE_KEY, store);
     const retained = new Set(keepIds);
-    if (validWorkspace(saved)) assetIds(saved).forEach((id) => retained.add(id));
     const backup = localWorkspace();
     if (backup) assetIds(backup).forEach((id) => retained.add(id));
-    const allKeys = await keys(store);
-    const obsolete = allKeys.filter((key) => typeof key === 'string'
-      && key.startsWith(ASSET_PREFIX) && !retained.has(key.slice(ASSET_PREFIX.length)));
-    if (obsolete.length) await delMany(obsolete, store);
+    // Read references and delete in one transaction, so concurrent uploads/removals cannot
+    // be overwritten using an earlier list of assets. IndexedDB serializes these writes.
+    await store('readwrite', (objectStore) => {
+      const saved = objectStore.get(WORKSPACE_KEY);
+      saved.onsuccess = () => {
+        if (validWorkspace(saved.result)) assetIds(saved.result).forEach((id) => retained.add(id));
+      };
+      const cursor = objectStore.openCursor();
+      cursor.onsuccess = () => {
+        const entry = cursor.result;
+        if (!entry) return;
+        if (typeof entry.key === 'string' && entry.key.startsWith(ASSET_PREFIX)
+          && !retained.has(entry.key.slice(ASSET_PREFIX.length)) && !isSavedPattern(entry.value)) {
+          entry.delete();
+        }
+        entry.continue();
+      };
+      return promisifyRequest(objectStore.transaction);
+    });
   } catch (error) {
     throw storageError(error);
   }
 }
 
-export async function clearWorkspace(): Promise<void> {
+export async function clearWorkspace(options: { preservePatternLibrary?: boolean } = {}): Promise<void> {
   try { localStorage.removeItem(BACKUP_KEY); } catch { /* IndexedDB may still be available. */ }
   try {
-    await clear(store);
+    if (!options.preservePatternLibrary) {
+      await clear(store);
+    } else {
+      await store('readwrite', (objectStore) => {
+        const cursor = objectStore.openCursor();
+        cursor.onsuccess = () => {
+          const entry = cursor.result;
+          if (!entry) return;
+          const keep = typeof entry.key === 'string' && entry.key.startsWith(ASSET_PREFIX) && isSavedPattern(entry.value);
+          if (!keep) entry.delete();
+          entry.continue();
+        };
+        return promisifyRequest(objectStore.transaction);
+      });
+    }
+    try { localStorage.removeItem(BACKUP_KEY); } catch { /* Best-effort metadata cleanup. */ }
   } catch (error) {
     throw storageError(error);
   }

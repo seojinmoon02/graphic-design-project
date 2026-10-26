@@ -56,6 +56,10 @@ export interface StoredAsset {
   name: string;
   type: 'pattern' | 'model';
   blob: Blob;
+  /** Pattern uploads remain reusable unless explicitly removed from the local library. */
+  inLibrary?: boolean;
+  /** Upload time for stable newest-first library ordering; legacy records may omit it. */
+  createdAt?: number;
 }
 export type AssetResolver = (id: string) => Promise<Blob | undefined>;
 export interface ViewportHandle {

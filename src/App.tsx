@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ArrowDownToLine, ArrowLeftRight, ArrowUpRight, Check, ChevronDown, CircleHelp, Expand, Focus, Layers2, LockKeyhole, Maximize2, Minus, PanelLeftClose, PanelLeftOpen, PanelRightClose, Plus, RotateCcw, ScanLine, UnlockKeyhole, X } from 'lucide-react';
 import { CAMERA_PRESETS, createWorkspace } from './defaults';
-import type { CameraPreset, CameraState, ExperimentState, ViewportHandle, WorkspaceState } from './types';
+import type { CameraPreset, CameraState, ExperimentState, StoredAsset, ViewportHandle, WorkspaceState } from './types';
 import { PatternPanel, ObjectPanel } from './components/Controls';
 import Viewport from './components/Viewport';
-import { assetIds, clearWorkspace, loadWorkspace, pruneAssets, rememberWorkspace, resolveAsset, saveAsset, saveWorkspace } from './lib/storage';
+import { assetIds, clearWorkspace, listSavedPatterns, loadWorkspace, pruneAssets, rememberWorkspace, removeSavedPattern, resolveAsset, saveAsset, saveWorkspace } from './lib/storage';
 import { validateModel, validatePattern } from './lib/uploads';
 import { createObject, disposeObject } from './scene/objects';
 
@@ -12,6 +12,7 @@ type Toast = { message: string; error?: boolean };
 
 export default function App() {
   const [workspace, setWorkspace] = useState<WorkspaceState>(createWorkspace);
+  const [savedPatterns, setSavedPatterns] = useState<StoredAsset[]>([]);
   const [hydrated, setHydrated] = useState(false);
   const [saveStatus, setSaveStatus] = useState('불러오는 중');
   const [busy, setBusy] = useState<'pattern' | 'model' | null>(null);
@@ -32,14 +33,16 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
-    loadWorkspace().then(saved => {
+    Promise.allSettled([loadWorkspace(), listSavedPatterns()]).then(([saved, patterns]) => {
       if (!active) return;
-      if (saved) setWorkspace(saved);
+      if (saved.status === 'fulfilled') {
+        if (saved.value) setWorkspace(saved.value);
+      } else {
+        notify('저장된 작업을 불러오지 못했습니다. 브라우저의 저장 공간 설정을 확인해 주세요.', true);
+      }
+      if (patterns.status === 'fulfilled') setSavedPatterns(patterns.value);
+      else notify('내 패턴 목록을 불러오지 못했습니다. 브라우저의 저장 공간 설정을 확인해 주세요.', true);
       setHydrated(true);
-    }).catch(() => {
-      if (!active) return;
-      setHydrated(true);
-      notify('저장된 작업을 불러오지 못했습니다. 브라우저의 저장 공간 설정을 확인해 주세요.', true);
     });
     return () => { active = false; };
   }, [notify]);
@@ -99,7 +102,9 @@ export default function App() {
       const id = crypto.randomUUID();
       const imageTypes: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', svg: 'image/svg+xml' };
       const mime = type === 'model' ? 'model/gltf-binary' : imageTypes[file.name.split('.').pop()?.toLowerCase() ?? ''];
-      await saveAsset({ id, name: file.name, type, blob: new Blob([file], { type: mime || file.type }) });
+      const asset: StoredAsset = { id, name: file.name, type, blob: new Blob([file], { type: mime || file.type }), createdAt: Date.now(), ...(type === 'pattern' ? { inLibrary: true } : {}) };
+      await saveAsset(asset);
+      if (type === 'pattern') setSavedPatterns(previous => [asset, ...previous]);
       setWorkspace(previous => {
         const current = previous.current;
         if (type === 'model') return { ...previous, current: { ...current, object: { ...current.object, kind: 'upload', assetId: id, fileName: file.name, scale: 1, rotation: 0 } } };
@@ -114,6 +119,29 @@ export default function App() {
     } catch (error) {
       notify(error instanceof Error ? error.message : '파일을 불러오지 못했습니다.', true);
     } finally { setBusy(null); }
+  }, [notify]);
+
+  const selectSavedPattern = useCallback((asset: StoredAsset) => {
+    setWorkspace(previous => {
+      const current = previous.current;
+      const source = { kind: 'upload' as const, assetId: asset.id, fileName: asset.name };
+      const both = current.linked || current.target === 'both';
+      return { ...previous, current: { ...current,
+        left: both || current.target === 'left' ? { ...current.left, ...source, originalBackground: current.left.background } : current.left,
+        back: both || current.target === 'back' ? { ...current.back, ...source, originalBackground: current.back.background } : current.back,
+      } };
+    });
+  }, []);
+
+  const deleteSavedPattern = useCallback(async (asset: StoredAsset) => {
+    try {
+      await removeSavedPattern(asset.id);
+      setSavedPatterns(previous => previous.filter(pattern => pattern.id !== asset.id));
+      await pruneAssets(assetIds(workspaceRef.current)).catch(() => { /* library removal succeeded; cleanup can retry later */ });
+      notify('내 패턴 목록에서 삭제했습니다. 적용 중인 장면과 A/B 기록은 유지됩니다.');
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '내 패턴을 삭제하지 못했습니다.', true);
+    }
   }, [notify]);
 
   const saveSnapshot = (slot: 'a' | 'b') => {
@@ -133,7 +161,7 @@ export default function App() {
 
   const reset = async () => {
     try {
-      await clearWorkspace();
+      await clearWorkspace({ preservePatternLibrary: true });
       const next = createWorkspace();
       setWorkspace(next);
       await saveWorkspace(next);
@@ -203,7 +231,7 @@ export default function App() {
         <aside className={`sidebar left-sidebar ${leftOpen ? 'mobile-open' : ''}`} aria-label="패턴 설정">
           <div className="panel-heading"><div><span className="eyebrow">BACKGROUND</span><h2>패턴 스튜디오</h2></div><button className="icon-button close-mobile" onClick={() => setLeftOpen(false)} aria-label="패턴 패널 닫기"><X size={17} /></button><Layers2 size={18} className="heading-icon" /></div>
           {workspace.compare && <div className="compare-callout"><p>저장된 두 실험을 비교하고 있어요.</p><button onClick={toggleCompare}>편집으로 돌아가기 <ArrowUpRight size={12} /></button></div>}
-          <div className={`panel-scroll ${workspace.compare ? 'compare-inactive' : ''}`} inert={workspace.compare}><PatternPanel state={current} onChange={update} onUpload={file => upload(file, 'pattern')} busy={busy === 'pattern'} /></div>
+          <div className={`panel-scroll ${workspace.compare ? 'compare-inactive' : ''}`} inert={workspace.compare}><PatternPanel state={current} onChange={update} onUpload={file => upload(file, 'pattern')} busy={busy === 'pattern'} savedPatterns={savedPatterns} onSelectSavedPattern={selectSavedPattern} onRemoveSavedPattern={deleteSavedPattern} /></div>
           <div className="panel-footnote"><span className="tiny-dot" />패턴을 바꾸고, 새로운 관계를 발견하세요.</div>
         </aside>
 
@@ -243,7 +271,7 @@ export default function App() {
       <footer className="app-footer"><span>작은 변화가 만드는, 새로운 시선.</span><span>DESIGNED TO EXPERIMENT<span className="footer-plus">+</span></span></footer>
       {toast && <div className={`toast ${toast.error ? 'toast-error' : ''}`} role={toast.error ? 'alert' : 'status'}>{toast.error ? <CircleHelp size={16} /> : <Check size={16} />}<span>{toast.message}</span><button aria-label="알림 닫기" onClick={() => setToast(null)}><X size={14} /></button></div>}
 
-      {resetOpen && <div className="modal-backdrop" onClick={() => setResetOpen(false)}><div className="modal" role="dialog" aria-modal="true" aria-labelledby="reset-title" onClick={event => event.stopPropagation()}><span className="modal-symbol"><RotateCcw size={24} /></span><h2 id="reset-title">새로운 실험을 시작할까요?</h2><p>현재 작업과 A/B 기록, 업로드한 파일이 삭제됩니다.<br />남기고 싶은 장면은 먼저 이미지로 저장해 주세요.</p><div className="modal-actions"><button className="button outline" onClick={() => setResetOpen(false)}>이어서 작업하기</button><button className="button primary" onClick={reset}>전체 초기화</button></div></div></div>}
+      {resetOpen && <div className="modal-backdrop" onClick={() => setResetOpen(false)}><div className="modal" role="dialog" aria-modal="true" aria-labelledby="reset-title" onClick={event => event.stopPropagation()}><span className="modal-symbol"><RotateCcw size={24} /></span><h2 id="reset-title">새로운 실험을 시작할까요?</h2><p>현재 작업과 A/B 기록, 업로드한 모델이 초기화됩니다.<br />내 패턴에 보관한 이미지는 그대로 남습니다.</p><div className="modal-actions"><button className="button outline" onClick={() => setResetOpen(false)}>이어서 작업하기</button><button className="button primary" onClick={reset}>전체 초기화</button></div></div></div>}
       {helpOpen && <div className="modal-backdrop" onClick={() => setHelpOpen(false)}><div className="modal guide-modal" role="dialog" aria-modal="true" aria-labelledby="help-title" onClick={event => event.stopPropagation()}><button className="icon-button modal-close" aria-label="가이드 닫기" onClick={() => setHelpOpen(false)}><X size={18} /></button><span className="eyebrow">HOW TO EXPERIMENT</span><h2 id="help-title">정답 없이, 자유롭게.</h2><p>작은 변화가 물건의 인상을 어떻게 바꾸는지 관찰해 보세요.</p><ol className="guide-steps"><li><span>01</span><div><b>배경을 골라보세요</b><p>기본 패턴을 선택하거나 직접 만든 이미지를 올려보세요. 벽마다 다른 패턴을 적용할 수도 있어요.</p></div></li><li><span>02</span><div><b>물건과 만나게 하세요</b><p>오브젝트와 색, 패턴의 크기를 바꾸며 조화를 찾아보세요. GLB 모델도 사용할 수 있어요.</p></div></li><li><span>03</span><div><b>다른 순간을 나란히 놓으세요</b><p>현재 상태를 A에 저장한 뒤 다른 조합을 B에 저장하세요. A/B 비교에서 함께 살펴볼 수 있어요.</p></div></li><li><span>04</span><div><b>나의 발견을 남기세요</b><p>관찰 노트를 적고 장면을 PNG로 저장하세요. 작업과 업로드 파일은 이 브라우저에 자동 저장됩니다.</p></div></li></ol><button className="button primary guide-start" onClick={() => setHelpOpen(false)}>실험 시작하기<ArrowUpRight size={15} /></button></div></div>}
     </div>
   );

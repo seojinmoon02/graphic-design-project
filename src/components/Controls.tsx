@@ -2,13 +2,20 @@ import { useEffect, useId, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent, ReactNode } from 'react';
 import { ChevronDown, Check, Link2, RotateCcw, Upload, LoaderCircle, ImagePlus, Box, Sun, Palette } from 'lucide-react';
 import { DEFAULT_PATTERN, createExperiment } from '../defaults';
-import type { ExperimentState, ObjectKind, PatternKind, PatternSettings } from '../types';
+import type { ExperimentState, ObjectKind, PatternKind, PatternSettings, StoredAsset } from '../types';
+import PatternLibrary from './PatternLibrary';
 
 interface PanelProps {
   state: ExperimentState;
   onChange: (patch: Partial<ExperimentState>) => void;
   onUpload: (file: File) => Promise<void>;
   busy: boolean;
+}
+
+interface PatternPanelProps extends PanelProps {
+  savedPatterns: StoredAsset[];
+  onSelectSavedPattern: (asset: StoredAsset) => void;
+  onRemoveSavedPattern: (asset: StoredAsset) => Promise<void>;
 }
 
 function Section({ number, title, children, className = '', initiallyOpen = true }: {
@@ -87,7 +94,7 @@ const PATTERNS: { kind: PatternKind; label: string }[] = [
   { kind: 'dot', label: '도트' }, { kind: 'grid', label: '격자' }, { kind: 'none', label: '단색' },
 ];
 
-export function PatternPanel({ state, onChange, onUpload, busy }: PanelProps) {
+export function PatternPanel({ state, onChange, onUpload, busy, savedPatterns, onSelectSavedPattern, onRemoveSavedPattern }: PatternPanelProps) {
   const pattern = state.target === 'left' ? state.left : state.back;
   const change = (patch: Partial<PatternSettings>) => {
     if (state.linked || state.target === 'both') onChange({ left: { ...state.left, ...patch }, back: { ...state.back, ...patch } });
@@ -103,6 +110,8 @@ export function PatternPanel({ state, onChange, onUpload, busy }: PanelProps) {
         <span className={`pattern-swatch pattern-${kind}`}>{pattern.kind === kind && <span className="pattern-selected"><Check size={10} strokeWidth={3} /></span>}</span>
         <span className="pattern-label">{label}</span>
       </button>)}</div>
+      <PatternLibrary patterns={savedPatterns} selectedAssetId={pattern.kind === 'upload' ? pattern.assetId : undefined}
+        onSelect={onSelectSavedPattern} onRemove={onRemoveSavedPattern} />
     </Section>
     <Section number="02" title="적용할 벽">
       <div className="segmented" aria-label="패턴 적용 대상">{([{ key: 'both', label: '두 벽' }, { key: 'left', label: '왼쪽 벽' }, { key: 'back', label: '뒤쪽 벽' }] as const).map(({ key, label }) =>
